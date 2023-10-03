@@ -1,114 +1,232 @@
-from __future__ import annotations
+# Template to deploy VPC, ECS Cluster, ALB and then nginx via Fargate
+# By Jason Umiker (jason.umiker@gmail.com)
 
-import logging
-from functools import wraps
-from typing import TYPE_CHECKING, Any, Callable, Container, TypeVar, cast
+from troposphere import Template, Parameter, Ref, GetAtt, Join, Output, \
+    ecs, ec2, elasticloadbalancingv2, logs, iam
 
-from pendulum.parsing import ParserError
-from sqlalchemy import text
+t = Template()
+t.add_version("2010-09-09")
 
-from airflow.api_connexion.exceptions import BadRequest
-from airflow.configuration import conf
-from airflow.utils import timezone
+# Get nginx image parameter
+NginxImage = t.add_parameter(Parameter(
+    "NginxImage",
+    Default="nginx:alpine",
+    Description="The nginx container image to run (e.g. nginx:alpine)",
+    Type="String"
+))
 
-if TYPE_CHECKING:
-    from datetime import datetime
+# Create the ECS Cluster
+ECSCluster = t.add_resource(ecs.Cluster(
+    "ECSCluster",
+    ClusterName="Fargate"
+))
 
-    from sqlalchemy.sql import Select
+# Create the VPC
+VPC = t.add_resource(ec2.VPC(
+    "VPC",
+    CidrBlock="10.0.0.0/16",
+    EnableDnsSupport="true",
+    EnableDnsHostnames="true"
+))
 
-log = logging.getLogger(__name__)
+PubSubnetAz1 = t.add_resource(ec2.Subnet(
+    "PubSubnetAz1",
+    CidrBlock="10.0.0.0/24",
+    VpcId=Ref(VPC),
+    AvailabilityZone=Join("", [Ref('AWS::Region'), "a"]),
+))
 
+PubSubnetAz2 = t.add_resource(ec2.Subnet(
+    "PubSubnetAz2",
+    CidrBlock="10.0.1.0/24",
+    VpcId=Ref(VPC),
+    AvailabilityZone=Join("", [Ref('AWS::Region'), "b"]),
+))
 
-def validate_istimezone(value: datetime) -> None:
-    """Validate that a datetime is not naive."""
-    if not value.tzinfo:
-        raise BadRequest("Invalid datetime format", detail="Naive datetime is disallowed")
+InternetGateway = t.add_resource(ec2.InternetGateway(
+    "InternetGateway",
+))
 
+AttachGateway = t.add_resource(ec2.VPCGatewayAttachment(
+    "AttachGateway",
+    VpcId=Ref(VPC),
+    InternetGatewayId=Ref(InternetGateway)
+))
 
-def format_datetime(value: str) -> datetime:
-    """
-    Format datetime objects.
+RouteViaIgw = t.add_resource(ec2.RouteTable(
+    "RouteViaIgw",
+    VpcId=Ref(VPC),
+))
 
-    Datetime format parser for args since connexion doesn't parse datetimes
-    https://github.com/zalando/connexion/issues/476
+PublicRouteViaIgw = t.add_resource(ec2.Route(
+    "PublicRouteViaIgw",
+    RouteTableId=Ref(RouteViaIgw),
+    DestinationCidrBlock="0.0.0.0/0",
+    GatewayId=Ref(InternetGateway),
+))
 
-    This should only be used within connection views because it raises 400
-    """
-    value = value.strip()
-    if value[-1] != "Z":
-        value = value.replace(" ", "+")
-    try:
-        return timezone.parse(value)
-    except (ParserError, TypeError) as err:
-        raise BadRequest("Incorrect datetime argument", detail=str(err))
+PubSubnet1RouteTableAssociation = t.add_resource(ec2.SubnetRouteTableAssociation(
+    "PubSubnet1RouteTableAssociation",
+    SubnetId=Ref(PubSubnetAz1),
+    RouteTableId=Ref(RouteViaIgw)
+))
 
+PubSubnet2RouteTableAssociation = t.add_resource(ec2.SubnetRouteTableAssociation(
+    "PubSubnet2RouteTableAssociation",
+    SubnetId=Ref(PubSubnetAz2),
+    RouteTableId=Ref(RouteViaIgw)
+))
 
-def check_limit(value: int) -> int:
-    """
-    Check the limit does not exceed configured value.
+# Create CloudWatch Log Group
+CWLogGroup = t.add_resource(logs.LogGroup(
+    "CWLogGroup",
+))
 
-    This checks the limit passed to view and raises BadRequest if
-    limit exceed user configured value
-    """
-    max_val = conf.getint("api", "maximum_page_limit")  # user configured max page limit
-    fallback = conf.getint("api", "fallback_page_limit")
+# Create the Task Execution Role
+TaskExecutionRole = t.add_resource(iam.Role(
+    "TaskExecutionRole",
+    AssumeRolePolicyDocument={
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": {"Service": ["ecs-tasks.amazonaws.com"]},
+            "Action": ["sts:AssumeRole"]
+        }]},
+))
 
-    if value > max_val:
-        log.warning(
-            "The limit param value %s passed in API exceeds the configured maximum page limit %s",
-            value,
-            max_val,
+# Create the Fargate Execution Policy (access to ECR and CW Logs)
+TaskExecutionPolicy = t.add_resource(iam.PolicyType(
+    "TaskExecutionPolicy",
+    PolicyName="fargate-execution",
+    PolicyDocument={"Version": "2012-10-17",
+                    "Statement": [{"Action": ["ecr:GetAuthorizationToken",
+                                              "ecr:BatchCheckLayerAvailability",
+                                              "ecr:GetDownloadUrlForLayer",
+                                              "ecr:BatchGetImage",
+                                              "logs:CreateLogStream",
+                                              "logs:PutLogEvents"],
+                                   "Resource": ["*"],
+                                   "Effect": "Allow"},
+                                  ]},
+    Roles=[Ref(TaskExecutionRole)],
+))
+
+# Create Security group that allows traffic into the ALB
+ALBSecurityGroup = t.add_resource(ec2.SecurityGroup(
+    "ALBSecurityGroup",
+    GroupDescription="ALB Security Group",
+    VpcId=Ref(VPC),
+    SecurityGroupIngress=[
+        ec2.SecurityGroupRule(
+            IpProtocol="tcp",
+            FromPort="80",
+            ToPort="80",
+            CidrIp="0.0.0.0/0",
         )
-        return max_val
-    if value == 0:
-        return fallback
-    if value < 0:
-        raise BadRequest("Page limit must be a positive integer")
-    return value
+    ]
+))
 
+# Create Security group for the Fargate tasks that allows 80 from the ALB
+TaskSecurityGroup = t.add_resource(ec2.SecurityGroup(
+    "TaskSecurityGroup",
+    GroupDescription="Task Security Group",
+    VpcId=Ref(VPC),
+    SecurityGroupIngress=[
+        ec2.SecurityGroupRule(
+            IpProtocol="tcp",
+            FromPort="80",
+            ToPort="80",
+            SourceSecurityGroupId=(GetAtt(ALBSecurityGroup, "GroupId"))
+        ),
+    ]
+))
 
-T = TypeVar("T", bound=Callable)
+# Create the ALB
+ALB = t.add_resource(elasticloadbalancingv2.LoadBalancer(
+    "ALB",
+    Scheme="internet-facing",
+    Subnets=[Ref(PubSubnetAz1), Ref(PubSubnetAz2)],
+    SecurityGroups=[Ref(ALBSecurityGroup)]
+))
 
+# Create the ALB"s Target Group
+ALBTargetGroup = t.add_resource(elasticloadbalancingv2.TargetGroup(
+    "ALBTargetGroup",
+    HealthCheckIntervalSeconds="30",
+    HealthCheckProtocol="HTTP",
+    HealthCheckTimeoutSeconds="10",
+    HealthyThresholdCount="4",
+    Matcher=elasticloadbalancingv2.Matcher(
+        HttpCode="200"),
+    Port=80,
+    Protocol="HTTP",
+    UnhealthyThresholdCount="3",
+    TargetType="ip",
+    VpcId=Ref(VPC)
+))
 
-def format_parameters(params_formatters: dict[str, Callable[[Any], Any]]) -> Callable[[T], T]:
-    """
-    Create a decorator to convert parameters using given formatters.
+ALBListener = t.add_resource(elasticloadbalancingv2.Listener(
+    "ALBListener",
+    Port="80",
+    Protocol="HTTP",
+    LoadBalancerArn=Ref(ALB),
+    DefaultActions=[elasticloadbalancingv2.Action(
+        Type="forward",
+        TargetGroupArn=Ref(ALBTargetGroup)
+    )]
+))
 
-    Using it allows you to separate parameter formatting from endpoint logic.
-
-    :param params_formatters: Map of key name and formatter function
-    """
-
-    def format_parameters_decorator(func: T) -> T:
-        @wraps(func)
-        def wrapped_function(*args, **kwargs):
-            for key, formatter in params_formatters.items():
-                if key in kwargs:
-                    kwargs[key] = formatter(kwargs[key])
-            return func(*args, **kwargs)
-
-        return cast(T, wrapped_function)
-
-    return format_parameters_decorator
-
-
-def apply_sorting(
-    query: Select,
-    order_by: str,
-    to_replace: dict[str, str] | None = None,
-    allowed_attrs: Container[str] | None = None,
-) -> Select:
-    """Apply sorting to query."""
-    lstriped_orderby = order_by.lstrip("-")
-    if allowed_attrs and lstriped_orderby not in allowed_attrs:
-        raise BadRequest(
-            detail=f"Ordering with '{lstriped_orderby}' is disallowed or "
-            f"the attribute does not exist on the model"
+TaskDefinition = t.add_resource(ecs.TaskDefinition(
+    "TaskDefinition",
+    DependsOn=TaskExecutionPolicy,
+    RequiresCompatibilities=["FARGATE"],
+    Cpu="512",
+    Memory="1GB",
+    NetworkMode="awsvpc",
+    ExecutionRoleArn=GetAtt(TaskExecutionRole, "Arn"),
+    ContainerDefinitions=[
+        ecs.ContainerDefinition(
+            Name="nginx",
+            Image=Ref(NginxImage),
+            Essential=True,
+            PortMappings=[ecs.PortMapping(ContainerPort=80)],
+            LogConfiguration=ecs.LogConfiguration(
+                LogDriver="awslogs",
+                Options={"awslogs-group": Ref(CWLogGroup),
+                         "awslogs-region": Ref("AWS::Region"),
+                         "awslogs-stream-prefix": "nginx"}
+            )
         )
-    if to_replace:
-        lstriped_orderby = to_replace.get(lstriped_orderby, lstriped_orderby)
-    if order_by[0] == "-":
-        order_by = f"{lstriped_orderby} desc"
-    else:
-        order_by = f"{lstriped_orderby} asc"
-    return query.order_by(text(order_by))
+    ]
+))
+
+Service = t.add_resource(ecs.Service(
+    "Service",
+    DependsOn=ALBListener,
+    Cluster=Ref(ECSCluster),
+    DesiredCount=1,
+    TaskDefinition=Ref(TaskDefinition),
+    LaunchType="FARGATE",
+    LoadBalancers=[
+        ecs.LoadBalancer(
+            ContainerName="nginx",
+            ContainerPort=80,
+            TargetGroupArn=Ref(ALBTargetGroup)
+        )
+    ],
+    NetworkConfiguration=ecs.NetworkConfiguration(
+        AwsvpcConfiguration=ecs.AwsvpcConfiguration(
+            AssignPublicIp="ENABLED",
+            Subnets=[Ref(PubSubnetAz1), Ref(PubSubnetAz2)],
+            SecurityGroups=[Ref(TaskSecurityGroup)],
+        )
+    )
+))
+
+# Output the ALB/Service URL
+t.add_output(Output(
+    "ALBURL",
+    Description="URL of the ALB",
+    Value=Join("", ["http://", GetAtt(ALB, "DNSName")]),
+))
+
+print(t.to_json())
